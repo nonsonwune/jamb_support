@@ -162,6 +162,4 @@ cython_debug/
 prev_codes/
 json/
 *.sh
-.sh
 *.json
-.json
