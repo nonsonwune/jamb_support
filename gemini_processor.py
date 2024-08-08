@@ -1,8 +1,10 @@
 # gemini_processor.py
 import os
+import re
 import json
+import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Any, Callable, Optional
 from dotenv import load_dotenv
 import google.generativeai as genai
 from tenacity import (
@@ -154,19 +156,38 @@ class GeminiProcessor:
         self.api_call_count += 1
 
     def construct_prompt(self, ticket: Dict[str, Any]) -> str:
+        sender_name = ticket.get("sender_name", "Candidate")
+        timestamp = next(
+            (
+                msg.get("timestamp", "N/A")
+                for msg in ticket["messages"]
+                if msg.get("sender_name") == ticket.get("sender_name", "Candidate")
+            ),
+            "N/A",
+        )
+
         return f"""
         Generate a reply for this support ticket:
         Ticket: {json.dumps(ticket)}
         
-        Format: {{"Hello [name], JAMB Support here,\\n\\n[reply]\\n\\nSincerely,\\nJAMB Support"}}
-        
+        Your response must be in the following format:
+        Hello {sender_name}, Welcome JAMB Support System,
+
+        [Your reply here]
+
+        Sincerely,
+        JAMB Support
+
         Guidelines:
         - Address the specific issue in the ticket
         - Be professional and helpful
+        - Do not use any placeholders, deduce and reply to the best of your ability.
+        - cosider {timestamp} when thinking of reply.
         - For admission acceptance, confirm it was through JAMB CAPS
         - Escalate complex issues to appropriate authorities
         - CAPS: Central Admission Processing System
-        - AIP: Admission In Progress
+        - Ensure the name is included exactly as provided
+        - Don't fabricate; state professionally you'll need to verify.
         """
 
     @retry(
@@ -179,19 +200,20 @@ class GeminiProcessor:
         ),
     )
     def generate_reply(self, prompt: str) -> str:
-        for _ in range(len(self.api_key_manager.api_keys)):
+        for _ in range(MAX_RETRIES):
             try:
                 self.check_rate_limit()
                 response = self.model.generate_content(prompt)
                 logger.debug(f"Raw response from API: {response.text}")
-                return self.parse_and_validate_reply(response.text)
-            except ResourceExhausted:
+                content = self.parse_and_validate_reply(response.text)
+                return self._format_reply(content)
+            except (ResourceExhausted, RateLimitExceededError):
                 logger.warning(
                     f"Rate limit reached for API key {self.api_key_manager.current_key_index + 1}. Rotating API key and retrying..."
                 )
                 self.api_key_manager.rotate_key()
                 self.initialize_gemini()
-                raise RateLimitExceededError("Gemini API rate limit exceeded")
+                time.sleep(5)  # 5-second delay before retrying
             except InvalidArgument as e:
                 if "API_KEY_INVALID" in str(e):
                     logger.error(
@@ -199,9 +221,6 @@ class GeminiProcessor:
                     )
                     self.api_key_manager.rotate_key()
                     self.initialize_gemini()
-                    raise APIKeyInvalidError(
-                        f"API key {self.api_key_manager.current_key_index} is invalid"
-                    )
                 else:
                     logger.error(f"Unexpected InvalidArgument: {str(e)}")
                     raise
@@ -213,69 +232,48 @@ class GeminiProcessor:
             "All API keys exhausted. Unable to generate reply."
         )
 
+    def _format_reply(self, content: str) -> str:
+        return re.sub(r"\[(\w+( \w+)*)\]", r"\1", content)
+
     def parse_and_validate_reply(self, raw_reply: str) -> str:
         try:
             logger.debug(f"Raw reply from API: {raw_reply}")
-            # Remove any leading/trailing whitespace and newlines
             cleaned_reply = raw_reply.strip()
             logger.debug(f"Cleaned reply: {cleaned_reply}")
 
-            # Remove any markdown code block indicators
             if cleaned_reply.startswith("```json"):
                 cleaned_reply = cleaned_reply[7:]
             if cleaned_reply.endswith("```"):
                 cleaned_reply = cleaned_reply[:-3]
 
-            # Try to parse as JSON
             try:
                 parsed_reply = json.loads(cleaned_reply)
+                if isinstance(parsed_reply, dict) and "content" in parsed_reply:
+                    content = parsed_reply["content"]
+                else:
+                    content = cleaned_reply
             except json.JSONDecodeError:
                 logger.warning(
                     "JSON parsing failed, attempting direct content extraction"
                 )
-                # If JSON parsing fails, try to extract content directly
-                content_start = cleaned_reply.find('"Hello')
-                content_end = cleaned_reply.rfind('"')
-                if content_start != -1 and content_end != -1:
-                    content = cleaned_reply[content_start + 1 : content_end]
-                    logger.info("Content extracted directly from malformed JSON")
-                    return content
+                content = cleaned_reply
 
-                # If direct extraction fails, raise an error
-                raise APIResponseValidationError(
-                    f"Failed to parse reply: {cleaned_reply}"
-                )
-
-            # If JSON parsing succeeds, extract the content
-            if isinstance(parsed_reply, dict) and any(
-                key.startswith("Hello") for key in parsed_reply
-            ):
-                content = next(
-                    value
-                    for key, value in parsed_reply.items()
-                    if key.startswith("Hello")
-                )
+            if content.startswith("Hello") and "JAMB Support" in content:
+                return content
             else:
-                raise APIResponseValidationError(
-                    "Invalid reply format: missing 'Hello' key"
-                )
+                raise APIResponseValidationError(f"Invalid response format: {content}")
 
-            message = {
-                "agent_name": "JAMB Support",
-                "timestamp": self.time_func().strftime("%Y-%m-%d %H:%M:%S"),
-                "content": content,
-            }
-
-            if not validate_message(message):
-                raise APIResponseValidationError("Reply failed validation checks")
-
-            logger.debug(f"Parsed and validated reply: {content}")
-            return content
         except Exception as e:
             logger.error(f"Error in parse_and_validate_reply: {str(e)}")
             raise APIResponseValidationError(
                 f"Failed to parse and validate reply: {str(e)}"
             )
+
+    def _extract_content_directly(self, text: str) -> Optional[str]:
+        match = re.search(r"Hello.*?JAMB Support.*", text, re.DOTALL)
+        if match:
+            return match.group()
+        return None
 
     def process_tickets_batch(
         self, tickets: List[Dict[str, Any]]
