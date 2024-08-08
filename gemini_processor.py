@@ -179,6 +179,7 @@ class GeminiProcessor:
         JAMB Support
 
         Guidelines:
+        - Friendly, but stern tone.
         - Address the specific issue in the ticket
         - Be professional and helpful
         - Do not use any placeholders, deduce and reply to the best of your ability.
@@ -188,6 +189,7 @@ class GeminiProcessor:
         - CAPS: Central Admission Processing System
         - Ensure the name is included exactly as provided
         - Don't fabricate; state professionally you'll need to verify.
+        - as much as possible sound human.
         """
 
     @retry(
